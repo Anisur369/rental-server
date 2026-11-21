@@ -1,9 +1,9 @@
 {
-  "name": "hermione_server",
+  "name": "rental_server",
   "version": "0.0.1",
   "description": "I am creating my first ever server",
   "license": "ISC",
-  "author": "anisur rahman",
+  "author": "anisur_rahman",
   "type": "module",
   "main": "index.js",
   "scripts": {
