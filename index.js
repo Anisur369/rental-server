@@ -2,17 +2,13 @@ import 'dotenv/config';
 import cors from 'cors';
 import express from 'express';
 import jwt from 'jsonwebtoken';
-import Stripe from 'stripe';
 import { MongoClient, ObjectId } from 'mongodb';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 const app = express();
 const port = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'equiprent_dev_jwt_secret_change_in_prod';
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:3000';
-
-const stripe = process.env.STRIPE_SECRET_KEY
-  ? new Stripe(process.env.STRIPE_SECRET_KEY)
-  : null;
 
 app.use(
   cors({
@@ -21,6 +17,11 @@ app.use(
   })
 );
 app.use(express.json());
+
+const BETTER_AUTH_JWKS_URL = new URL(
+  `${CLIENT_URL.replace(/\/$/, '')}/api/auth/jwks`
+);
+const JWKS = createRemoteJWKSet(BETTER_AUTH_JWKS_URL);
 
 // MongoDB Connection
 const mongoUri = process.env.BETTER_AUTH_DB_URL;
@@ -31,7 +32,7 @@ if (!mongoUri) {
 const client = new MongoClient(mongoUri);
 const db = client.db('equipmentRentalDB');
 
-const usersCollection = db.collection('users');
+const usersCollection = db.collection('user');
 const equipmentsCollection = db.collection('equipment');
 const bookingsCollection = db.collection('bookings');
 const favoritesCollection = db.collection('favorites');
@@ -54,28 +55,8 @@ function toObjectId(id) {
   return ObjectId.isValid(id) ? new ObjectId(id) : null;
 }
 
-function normalizeRole(role) {
-  const val = String(role || 'Customer').trim().toLowerCase();
-  if (val === 'admin') return 'Admin';
-  if (val === 'owner') return 'Owner';
-  return 'Customer';
-}
-
-function signAccessToken(user) {
-  return jwt.sign(
-    {
-      id: user._id?.toString(),
-      email: user.email,
-      name: user.name || '',
-      role: normalizeRole(user.role),
-    },
-    JWT_SECRET,
-    { expiresIn: '7d' }
-  );
-}
-
 // ==========================================
-// RBAC & JWT Middlewares
+// Token Verification Middleware
 // ==========================================
 export const verifyToken = async (req, res, next) => {
   try {
@@ -89,23 +70,40 @@ export const verifyToken = async (req, res, next) => {
       return res.status(401).json({ message: 'Unauthorized: Missing access token.' });
     }
 
-    const decoded = jwt.verify(token, JWT_SECRET);
-    let dbUser = null;
+    let payload = null;
 
-    if (decoded?.email) {
-      dbUser = await usersCollection.findOne({ email: decoded.email.toLowerCase() });
+    // 1) Better Auth JWT (JWKS) verify করার চেষ্টা
+    try {
+      const { payload: betterAuthPayload } = await jwtVerify(token, JWKS);
+      payload = betterAuthPayload;
+    } catch {
+      // 2) Fallback: custom JWT_SECRET দিয়ে verify করার চেষ্টা
+      payload = jwt.verify(token, JWT_SECRET);
     }
 
-    if (dbUser?.status === 'Suspended') {
-      return res.status(403).json({ message: 'Forbidden: Account is suspended.' });
+    const email = (payload.email || '').toLowerCase();
+    let dbUser = null;
+
+    if (email) {
+      dbUser = await usersCollection.findOne({ email });
+    } else if (payload.sub || payload.id) {
+      const userId = payload.sub || payload.id;
+      const objId = toObjectId(userId);
+      dbUser = await usersCollection.findOne(
+        objId ? { _id: objId } : { id: userId }
+      );
     }
 
     req.user = {
-      id: dbUser?._id?.toString() || decoded.id,
-      email: (dbUser?.email || decoded.email || '').toLowerCase(),
-      name: dbUser?.name || decoded.name || '',
-      role: normalizeRole(dbUser?.role || decoded.role),
+      id: payload.sub || payload.id || dbUser?._id?.toString() || '',
+      email: (dbUser?.email || email || '').toLowerCase(),
+      name: dbUser?.name || payload.name || '',
+      role: dbUser?.role || payload.role || 'Customer',
     };
+
+    if (!req.user.email) {
+      return res.status(401).json({ message: 'Unauthorized: Token missing user email.' });
+    }
 
     next();
   } catch (err) {
@@ -113,130 +111,15 @@ export const verifyToken = async (req, res, next) => {
   }
 };
 
-export const verifyRenter = (req, res, next) => {
-  const role = normalizeRole(req.user?.role);
-  if (role === 'Customer' || role === 'Admin') {
-    return next();
-  }
-  return res.status(403).json({ message: 'Forbidden: Customer/Renter access required.' });
-};
-
-export const verifyCustomer = verifyRenter;
-
-export const verifyOwner = (req, res, next) => {
-  const role = normalizeRole(req.user?.role);
-  if (role === 'Owner' || role === 'Admin') {
-    return next();
-  }
-  return res.status(403).json({ message: 'Forbidden: Owner access required.' });
-};
-
-export const verifyAdmin = (req, res, next) => {
-  const role = normalizeRole(req.user?.role);
-  if (role === 'Admin') {
-    return next();
-  }
-  return res.status(403).json({ message: 'Forbidden: Admin access required.' });
-};
-
 // ==========================================
-// Root & Auth / JWT Endpoints
+// Root Route
 // ==========================================
 app.get('/', (req, res) => {
   res.send('Equipment Rental Platform API Server is running!');
 });
 
-// Register / Sync user (default role: Customer)
-app.post('/api/users/register', async (req, res) => {
-  try {
-    const { name, email, image, phone, address } = req.body || {};
-    if (!email) {
-      return res.status(400).json({ message: 'Email is required.' });
-    }
-
-    const cleanEmail = String(email).trim().toLowerCase();
-    const existing = await usersCollection.findOne({ email: cleanEmail });
-
-    if (existing) {
-      const token = signAccessToken(existing);
-      return res.status(200).json({
-        message: 'User already exists.',
-        token,
-        user: existing,
-      });
-    }
-
-    const newUser = {
-      name: String(name || 'Customer').trim(),
-      email: cleanEmail,
-      image: String(image || '').trim(),
-      phone: String(phone || '').trim(),
-      address: String(address || '').trim(),
-      role: 'Customer',
-      status: 'Active',
-      createdAt: new Date().toISOString(),
-    };
-
-    const insertResult = await usersCollection.insertOne(newUser);
-    const savedUser = { _id: insertResult.insertedId, ...newUser };
-    const token = signAccessToken(savedUser);
-
-    res.status(201).json({
-      message: 'User registered successfully.',
-      token,
-      user: savedUser,
-    });
-  } catch (err) {
-    console.error('Register error:', err);
-    res.status(500).json({ message: 'Failed to register user.' });
-  }
-});
-
-// Issue JWT access token after Better Auth login / Google sign-in
-app.post('/api/auth/jwt', async (req, res) => {
-  try {
-    const { email, name, image } = req.body || {};
-    if (!email) {
-      return res.status(400).json({ message: 'Email is required to issue token.' });
-    }
-
-    const cleanEmail = String(email).trim().toLowerCase();
-    let user = await usersCollection.findOne({ email: cleanEmail });
-
-    if (!user) {
-      const newUser = {
-        name: String(name || cleanEmail.split('@')[0]).trim(),
-        email: cleanEmail,
-        image: String(image || '').trim(),
-        phone: '',
-        address: '',
-        role: 'Customer',
-        status: 'Active',
-        createdAt: new Date().toISOString(),
-      };
-      const inserted = await usersCollection.insertOne(newUser);
-      user = { _id: inserted.insertedId, ...newUser };
-    }
-
-    if (user.status === 'Suspended') {
-      return res.status(403).json({ message: 'Your account is suspended.' });
-    }
-
-    const token = signAccessToken(user);
-    res.json({
-      token,
-      accessToken: token,
-      role: normalizeRole(user.role),
-      user,
-    });
-  } catch (err) {
-    console.error('JWT issue error:', err);
-    res.status(500).json({ message: 'Failed to generate access token.' });
-  }
-});
-
 // ==========================================
-// Profile Endpoints (Customer, Owner, Admin)
+// Profile Endpoints
 // ==========================================
 app.get('/api/users/profile', verifyToken, async (req, res) => {
   try {
@@ -252,14 +135,21 @@ app.get('/api/users/profile', verifyToken, async (req, res) => {
 
 app.patch('/api/users/profile', verifyToken, async (req, res) => {
   try {
-    const { name, image, phone, address } = req.body || {};
+    const { name, image, phone, phoneNumber, address } = req.body || {};
+    const finalPhone = phone !== undefined ? phone : phoneNumber;
+
     const updateDoc = {
       $set: {
         ...(name !== undefined ? { name: String(name).trim() } : {}),
         ...(image !== undefined ? { image: String(image).trim() } : {}),
-        ...(phone !== undefined ? { phone: String(phone).trim() } : {}),
+        ...(finalPhone !== undefined ? { phone: String(finalPhone).trim() } : {}),
         ...(address !== undefined ? { address: String(address).trim() } : {}),
         updatedAt: new Date().toISOString(),
+      },
+      $setOnInsert: {
+        email: req.user.email,
+        role: req.user.role || 'Customer',
+        createdAt: new Date().toISOString(),
       },
     };
 
@@ -276,9 +166,8 @@ app.patch('/api/users/profile', verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// Equipment Endpoints (Public + Owner + Admin)
+// Equipment Endpoints
 // ==========================================
-// Public: Featured approved equipment (default limit 6)
 app.get('/api/equipment/featured', async (req, res) => {
   try {
     const limit = Math.min(20, Math.max(1, Number(req.query.limit) || 6));
@@ -293,7 +182,6 @@ app.get('/api/equipment/featured', async (req, res) => {
   }
 });
 
-// Public: All approved equipment with server-side search, filter, sort, pagination
 app.get('/api/equipment', async (req, res) => {
   try {
     const {
@@ -379,16 +267,14 @@ app.get('/api/equipment', async (req, res) => {
   }
 });
 
-// Owner: Equipment added by logged-in owner
-app.get('/api/equipment/owner', verifyToken, verifyOwner, async (req, res) => {
+app.get('/api/equipment/owner', verifyToken, async (req, res) => {
   try {
     const email = (req.query.email || req.user.email || '').toLowerCase();
-    const filter =
-      req.user.role === 'Admin' && !req.query.email
-        ? {}
-        : {
-            $or: [{ ownerEmail: email }, { 'owner.email': email }],
-          };
+    const filter = email
+      ? {
+          $or: [{ ownerEmail: email }, { 'owner.email': email }],
+        }
+      : {};
 
     const items = await equipmentsCollection.find(filter).sort({ createdAt: -1 }).toArray();
     res.json({ data: items });
@@ -397,8 +283,7 @@ app.get('/api/equipment/owner', verifyToken, verifyOwner, async (req, res) => {
   }
 });
 
-// Admin: All equipment regardless of status
-app.get('/api/equipment/admin/all', verifyToken, verifyAdmin, async (req, res) => {
+app.get('/api/equipment/admin/all', verifyToken, async (req, res) => {
   try {
     const items = await equipmentsCollection.find({}).sort({ createdAt: -1 }).toArray();
     res.json({ data: items });
@@ -407,7 +292,6 @@ app.get('/api/equipment/admin/all', verifyToken, verifyAdmin, async (req, res) =
   }
 });
 
-// Single equipment details
 app.get('/api/equipment/:id', async (req, res) => {
   try {
     const oid = toObjectId(req.params.id);
@@ -424,8 +308,7 @@ app.get('/api/equipment/:id', async (req, res) => {
   }
 });
 
-// Owner: Add new equipment (default status: Pending)
-app.post('/api/equipment', verifyToken, verifyOwner, async (req, res) => {
+app.post('/api/equipment', verifyToken, async (req, res) => {
   try {
     const body = req.body || {};
     if (!body.name || !body.category || !body.location || !body.rentalPrice) {
@@ -466,23 +349,11 @@ app.post('/api/equipment', verifyToken, verifyOwner, async (req, res) => {
   }
 });
 
-// Owner/Admin: Update equipment
-app.patch('/api/equipment/:id', verifyToken, verifyOwner, async (req, res) => {
+app.patch('/api/equipment/:id', verifyToken, async (req, res) => {
   try {
     const oid = toObjectId(req.params.id);
     if (!oid) {
       return res.status(400).json({ message: 'Invalid equipment ID.' });
-    }
-
-    const existing = await equipmentsCollection.findOne({ _id: oid });
-    if (!existing) {
-      return res.status(404).json({ message: 'Equipment not found.' });
-    }
-
-    const isOwner =
-      (existing.ownerEmail || existing.owner?.email || '').toLowerCase() === req.user.email;
-    if (req.user.role !== 'Admin' && !isOwner) {
-      return res.status(403).json({ message: 'Forbidden: You do not own this item.' });
     }
 
     const allowed = {};
@@ -499,6 +370,7 @@ app.patch('/api/equipment/:id', verifyToken, verifyOwner, async (req, res) => {
       'model',
       'image',
       'termsAndConditions',
+      'status',
     ];
 
     for (const key of fields) {
@@ -510,10 +382,6 @@ app.patch('/api/equipment/:id', verifyToken, verifyOwner, async (req, res) => {
       }
     }
 
-    if (req.user.role === 'Admin' && req.body.status) {
-      allowed.status = req.body.status;
-    }
-
     allowed.updatedAt = new Date().toISOString();
 
     const updated = await equipmentsCollection.findOneAndUpdate(
@@ -522,14 +390,17 @@ app.patch('/api/equipment/:id', verifyToken, verifyOwner, async (req, res) => {
       { returnDocument: 'after' }
     );
 
+    if (!updated) {
+      return res.status(404).json({ message: 'Equipment not found.' });
+    }
+
     res.json({ message: 'Equipment updated.', data: updated });
   } catch (err) {
     res.status(500).json({ message: 'Failed to update equipment.' });
   }
 });
 
-// Admin: Approve or Reject equipment
-app.patch('/api/equipment/:id/status', verifyToken, verifyAdmin, async (req, res) => {
+app.patch('/api/equipment/:id/status', verifyToken, async (req, res) => {
   try {
     const oid = toObjectId(req.params.id);
     const { status } = req.body || {};
@@ -553,26 +424,18 @@ app.patch('/api/equipment/:id/status', verifyToken, verifyAdmin, async (req, res
   }
 });
 
-// Owner/Admin: Delete equipment
-app.delete('/api/equipment/:id', verifyToken, verifyOwner, async (req, res) => {
+app.delete('/api/equipment/:id', verifyToken, async (req, res) => {
   try {
     const oid = toObjectId(req.params.id);
     if (!oid) {
       return res.status(400).json({ message: 'Invalid equipment ID.' });
     }
 
-    const existing = await equipmentsCollection.findOne({ _id: oid });
-    if (!existing) {
+    const deleted = await equipmentsCollection.findOneAndDelete({ _id: oid });
+    if (!deleted) {
       return res.status(404).json({ message: 'Equipment not found.' });
     }
 
-    const isOwner =
-      (existing.ownerEmail || existing.owner?.email || '').toLowerCase() === req.user.email;
-    if (req.user.role !== 'Admin' && !isOwner) {
-      return res.status(403).json({ message: 'Forbidden: You cannot delete this item.' });
-    }
-
-    await equipmentsCollection.deleteOne({ _id: oid });
     res.json({ message: 'Equipment deleted successfully.' });
   } catch (err) {
     res.status(500).json({ message: 'Failed to delete equipment.' });
@@ -580,9 +443,9 @@ app.delete('/api/equipment/:id', verifyToken, verifyOwner, async (req, res) => {
 });
 
 // ==========================================
-// Favorites Endpoints (Customer / Renter)
+// Favorites Endpoints
 // ==========================================
-app.get('/api/favorites', verifyToken, verifyRenter, async (req, res) => {
+app.get('/api/favorites', verifyToken, async (req, res) => {
   try {
     const email = (req.query.email || req.user.email).toLowerCase();
     const items = await favoritesCollection
@@ -595,10 +458,19 @@ app.get('/api/favorites', verifyToken, verifyRenter, async (req, res) => {
   }
 });
 
-app.post('/api/favorites', verifyToken, verifyRenter, async (req, res) => {
+app.post('/api/favorites', verifyToken, async (req, res) => {
   try {
-    const { equipmentId, equipmentName, category, location, rentalPrice, rentalType, availableQuantity, image } =
-      req.body || {};
+    const {
+      equipmentId,
+      equipmentName,
+      category,
+      location,
+      rentalPrice,
+      rentalType,
+      availableQuantity,
+      image,
+    } = req.body || {};
+
     if (!equipmentId) {
       return res.status(400).json({ message: 'equipmentId is required.' });
     }
@@ -632,7 +504,7 @@ app.post('/api/favorites', verifyToken, verifyRenter, async (req, res) => {
   }
 });
 
-app.delete('/api/favorites/:id', verifyToken, verifyRenter, async (req, res) => {
+app.delete('/api/favorites/:id', verifyToken, async (req, res) => {
   try {
     const oid = toObjectId(req.params.id);
     const filter = oid
@@ -650,10 +522,9 @@ app.delete('/api/favorites/:id', verifyToken, verifyRenter, async (req, res) => 
 });
 
 // ==========================================
-// Bookings & Stripe Payment Endpoints
+// Bookings & Payment Record Endpoints
 // ==========================================
-// Customer: My rentals
-app.get('/api/bookings/my-rentals', verifyToken, verifyRenter, async (req, res) => {
+app.get('/api/bookings/my-rentals', verifyToken, async (req, res) => {
   try {
     const email = (req.query.email || req.user.email).toLowerCase();
     const list = await bookingsCollection
@@ -666,8 +537,7 @@ app.get('/api/bookings/my-rentals', verifyToken, verifyRenter, async (req, res) 
   }
 });
 
-// Owner: Rentals on owner's equipment
-app.get('/api/bookings/owner-rentals', verifyToken, verifyOwner, async (req, res) => {
+app.get('/api/bookings/owner-rentals', verifyToken, async (req, res) => {
   try {
     const email = (req.query.email || req.user.email).toLowerCase();
     const list = await bookingsCollection
@@ -680,8 +550,7 @@ app.get('/api/bookings/owner-rentals', verifyToken, verifyOwner, async (req, res
   }
 });
 
-// Admin: All rental bookings
-app.get('/api/bookings/admin/all', verifyToken, verifyAdmin, async (req, res) => {
+app.get('/api/bookings/admin/all', verifyToken, async (req, res) => {
   try {
     const list = await bookingsCollection.find({}).sort({ createdAt: -1 }).toArray();
     res.json({ data: list });
@@ -690,8 +559,7 @@ app.get('/api/bookings/admin/all', verifyToken, verifyAdmin, async (req, res) =>
   }
 });
 
-// Create booking (Pending payment)
-app.post('/api/bookings', verifyToken, verifyRenter, async (req, res) => {
+app.post('/api/bookings', verifyToken, async (req, res) => {
   try {
     const body = req.body || {};
     const qty = Math.max(1, Number(body.requiredQuantity || 1));
@@ -735,8 +603,7 @@ app.post('/api/bookings', verifyToken, verifyRenter, async (req, res) => {
   }
 });
 
-// Owner/Admin: Update booking status
-app.patch('/api/bookings/:id/status', verifyToken, verifyOwner, async (req, res) => {
+app.patch('/api/bookings/:id/status', verifyToken, async (req, res) => {
   try {
     const oid = toObjectId(req.params.id);
     const { bookingStatus } = req.body || {};
@@ -762,66 +629,7 @@ app.patch('/api/bookings/:id/status', verifyToken, verifyOwner, async (req, res)
   }
 });
 
-// Stripe: Create Checkout Session
-app.post('/api/payments/create-checkout-session', verifyToken, verifyRenter, async (req, res) => {
-  try {
-    const body = req.body || {};
-    const amount = Number(body.totalAmount || body.bookingAmount || 0);
-
-    if (amount <= 0) {
-      return res.status(400).json({ message: 'Valid rental amount is required.' });
-    }
-
-    const successUrl =
-      body.successUrl || `${CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`;
-    const cancelUrl = body.cancelUrl || `${CLIENT_URL}/payment/cancel`;
-
-    if (stripe) {
-      const session = await stripe.checkout.sessions.create({
-        mode: 'payment',
-        payment_method_types: ['card'],
-        customer_email: req.user.email,
-        line_items: [
-          {
-            price_data: {
-              currency: 'bdt',
-              product_data: {
-                name: body.equipmentName || 'Equipment Rental',
-                description: `Qty: ${body.requiredQuantity || 1} | ${body.startDate || ''} to ${body.endDate || ''}`,
-              },
-              unit_amount: Math.round(amount * 100),
-            },
-            quantity: 1,
-          },
-        ],
-        metadata: {
-          bookingId: String(body.bookingId || ''),
-          equipmentId: String(body.equipmentId || ''),
-          customerEmail: req.user.email,
-        },
-        success_url: successUrl.includes('{CHECKOUT_SESSION_ID}')
-          ? successUrl
-          : `${successUrl}?session_id={CHECKOUT_SESSION_ID}&amount=${amount}`,
-        cancel_url: cancelUrl,
-      });
-
-      return res.json({ url: session.url, sessionId: session.id });
-    }
-
-    const mockSessionId = `cs_test_${Date.now()}`;
-    res.json({
-      sessionId: mockSessionId,
-      transactionId: mockSessionId,
-      url: null,
-    });
-  } catch (err) {
-    console.error('Stripe checkout session error:', err);
-    res.status(500).json({ message: 'Failed to create Stripe checkout session.' });
-  }
-});
-
-// Stripe: Confirm payment, update booking & record transaction in payments collection
-app.post('/api/payments/confirm', verifyToken, verifyRenter, async (req, res) => {
+app.post('/api/payments/confirm', verifyToken, async (req, res) => {
   try {
     const { sessionId, bookingDraft, totalAmount } = req.body || {};
     const txnId = sessionId || `txn_${Date.now()}`;
@@ -905,9 +713,9 @@ app.post('/api/payments/confirm', verifyToken, verifyRenter, async (req, res) =>
 });
 
 // ==========================================
-// Admin: Users & Role Management
+// Users Endpoints
 // ==========================================
-app.get('/api/users', verifyToken, verifyAdmin, async (req, res) => {
+app.get('/api/users', verifyToken, async (req, res) => {
   try {
     const users = await usersCollection.find({}).sort({ createdAt: -1 }).toArray();
     res.json({ data: users });
@@ -916,12 +724,12 @@ app.get('/api/users', verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-app.patch('/api/users/:id/role', verifyToken, verifyAdmin, async (req, res) => {
+app.patch('/api/users/:id/role', verifyToken, async (req, res) => {
   try {
     const oid = toObjectId(req.params.id);
-    const role = normalizeRole(req.body?.role);
-    if (!oid) {
-      return res.status(400).json({ message: 'Invalid user ID.' });
+    const { role } = req.body || {};
+    if (!oid || !role) {
+      return res.status(400).json({ message: 'Invalid user ID or role.' });
     }
 
     const updated = await usersCollection.findOneAndUpdate(
@@ -940,7 +748,7 @@ app.patch('/api/users/:id/role', verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-app.patch('/api/users/:id', verifyToken, verifyAdmin, async (req, res) => {
+app.patch('/api/users/:id', verifyToken, async (req, res) => {
   try {
     const oid = toObjectId(req.params.id);
     if (!oid) {
@@ -949,9 +757,9 @@ app.patch('/api/users/:id', verifyToken, verifyAdmin, async (req, res) => {
 
     const updateFields = { updatedAt: new Date().toISOString() };
     if (req.body?.role) {
-      updateFields.role = normalizeRole(req.body.role);
+      updateFields.role = req.body.role;
     }
-    if (req.body?.status && ['Active', 'Suspended'].includes(req.body.status)) {
+    if (req.body?.status) {
       updateFields.status = req.body.status;
     }
 
@@ -972,9 +780,9 @@ app.patch('/api/users/:id', verifyToken, verifyAdmin, async (req, res) => {
 });
 
 // ==========================================
-// Admin & Owner Analytics Endpoints
+// Analytics Endpoints
 // ==========================================
-app.get('/api/analytics/admin', verifyToken, verifyAdmin, async (req, res) => {
+app.get('/api/analytics/admin', verifyToken, async (req, res) => {
   try {
     const [totalUsers, totalEquipment, totalBookings, pendingApprovals, completedRentals] =
       await Promise.all([
@@ -1007,7 +815,7 @@ app.get('/api/analytics/admin', verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-app.get('/api/analytics/owner', verifyToken, verifyOwner, async (req, res) => {
+app.get('/api/analytics/owner', verifyToken, async (req, res) => {
   try {
     const email = (req.query.email || req.user.email).toLowerCase();
     const ownerFilter = { $or: [{ ownerEmail: email }, { 'owner.email': email }] };
